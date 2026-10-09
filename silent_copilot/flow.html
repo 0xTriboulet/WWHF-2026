@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>silent_copilot — code flow</title>
+<style>
+  body { font-family: ui-monospace, Consolas, monospace; background:#0f1115; color:#e6e6e6; margin:24px; }
+  h1 { font-size:20px; } p.note { color:#9aa4b2; max-width:1200px; }
+  .mermaid { background:#f5f5f5; padding:16px; border-radius:8px; }
+  code { color:#7ee787; }
+</style>
+</head>
+<body>
+<h1><code>silent_copilot.exe</code> — harvest M365 Copilot's live Chathub session from memory → replay prompt over it → reply to stdout</h1>
+<p class="note">Derived 1:1 from <code>silent_copilot/silent_copilot.c</code> (post-format).
+Exit code is 0 <b>iff</b> a Copilot reply was captured. Tunables: per-token attempt 30 s,
+global deadline 420 s, session retries 25, hide-watch 90 s.</p>
+
+<pre class="mermaid">
+flowchart TD
+  M0([main argc argv]) --> M1["init_output(): capture inherited STD_OUTPUT_HANDLE + STD_ERROR_HANDLE FIRST;\nAttachConsole(ATTACH_PARENT_PROCESS) only if both missing;\nstderr falls back to stdout handle and vice versa"]
+  M1 --> M2{"argv1 == --launch-hide ?"}
+  M2 -- "yes" --> HIDE
+
+  subgraph HIDE["do_launch_hide() — runs in the user's interactive session"]
+    H1["CoInitializeEx(MTA)  → fail: return 10"] --> H2["SetWinEventHook x2: EVENT_OBJECT_CREATE + EVENT_OBJECT_SHOW\nout-of-context + skip-own, callback = hide_win_event"]
+    H2 --> H3["CoCreateInstance(CLSID_ApplicationActivationManager,\nCLSID 45BA127D-…)  → fail: return 11"]
+    H3 --> H4["ActivateApplication(AUMID\nMicrosoft.MicrosoftOfficeHub_8wekyb3d8bbwe!Microsoft.MicrosoftOfficeHub)\n→ pid  → fail: return 12"]
+    H4 --> L(("loop t &lt; 900 iterations\n(90 s x 100 ms)"))
+    L --> L1["pump PeekMessage/Translate/Dispatch\n(out-of-context WinEvent delivery needs a msg loop)"]
+    L1 --> L2["collect_pids: m365copilot.exe + msedgewebview2.exe"]
+    L2 --> L3["EnumWindows; hwnd pid in set AND IsWindowVisible\n→ ShowWindow(hwnd, SW_HIDE); g_hidden_count++"]
+    L3 --> L4["Sleep(100)"] --> L
+    L -->|"90 s elapsed"| H9["UnhookWinEvent x2, CoUninitialize → return 0"]
+  end
+
+  M2 -- "no" --> M3["prompt = argv1 or hello from silent_copilot\njson_escape(prompt) → fail: return 1"]
+  M3 --> M4{"ensure_session_material()"}
+  M4 -- "!= 0" --> X1[("harvest failed → return 1")]
+
+  subgraph ESM["ensure_session_material() — up to 25 tries (sleep 5 s or 4 s between)"]
+    E1{"app_process_running()?\n(m365copilot.exe in collect_pids)"}
+    E1 -- "no" --> E1b{"self_in_active_interactive_session()?\n(console/PS run in target user's session)"}
+    E1b -- "yes" --> E1c["CreateThread(hide_worker): activate AUMID\nin-process + hide windows (no seclogon/token/scheduler)"] --> E8
+    E1b -- "no (SSH/service session)" --> E2{"pick_target_session():\nWTS active session owned by GetUserName()?"}
+    E2 -- "none" --> E3["log cannot launch"]
+    E2 -- "sid" --> E4["launch_in_session(sid)"]
+    E3 --> E8["Sleep(5000), next try"]
+    E4 --> E8
+    E1 -- "yes" --> E7["scan_all_processes()"]
+    E7 --> E9{"g_ntok &gt; 0 AND g_sten set?"}
+    E9 -- "no" --> E10["Sleep(4000), next try"]
+    E9 -- "yes" --> E11["task_delete (remove SilentCopilotBoop)\n→ return 0"]
+  end
+
+  subgraph LIS["launch_in_session(sid)"]
+    P1["seclogon_ensure(): OpenSCManager→OpenService seclogon\n→ StartServiceW if STOPPED; poll until RUNNING"]
+    P1 --> P2["OpenProcessToken(self, TOKEN_QUERY)"]
+    P2 --> P3{"iterate pids, ≤ 3 borrow attempts"}
+    P3 --> P4["OpenProcess(QUERY_LIMITED_INFORMATION)\nOpenProcessToken(h, QUERY|DUPLICATE)"]
+    P4 --> P5["DuplicateTokenEx(MAXIMUM_ALLOWED,\nSecurityImpersonation → TokenPrimary)"]
+    P5 --> P6["CreateProcessWithTokenW(LOGON_WITH_PROFILE,\nself.exe --launch-hide, CREATE_NO_WINDOW)"]
+    P6 -- "success" --> P7["return 0"]
+    P6 -- "fail (token path)" --> P8["launch_via_tasksched(): Task Scheduler COM\nNewTask → Settings (StartWhenAvailable, no battery aborts,\nExecutionTimeLimit PT5M) → ExecAction self.exe --launch-hide\n→ RegisterTaskDefinition(SilentCopilotBoop, current user,\nTASK_CREATE_OR_UPDATE, TASK_LOGON_INTERACTIVE_TOKEN) → Run()"]
+  end
+
+  subgraph SCAN["scan_all_processes() → scan_process(h) → scan_buf()"]
+    K1["CreateToolhelp32Snapshot / collect_pids\nOpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)\n(m365copilot.exe and msedgewebview2.exe children first)"]
+    K1 --> K2["VirtualQueryEx walk: MEM_COMMIT +\nreadable_protect(PAGE_READONLY/READWRITE/EXECUTE_READ/\nEXECUTE_READWRITE/WRITECOPY/EXECUTE_WRITECOPY) + !PAGE_GUARD\ncap at 0x7FFFFFFFFFFF"]
+    K2 --> K3["ReadProcessMemory in 256 KiB chunks,\nkeep 128 B tail overlap between reads"]
+    K3 --> K4["scan_buf: find artifacts"]
+    K4 --> K4a["STEN: GUID ending …aaaaaaaaaaaa"]
+    K4 --> K4b["OID: v1 GUID 00000000-0000-1…"]
+    K4 --> K4c["variants: EnableMcpServerWidgets… string run"]
+    K4 --> K4d["JWE: eyJhbGciOiJkaXIi base64url run, len ≥ 200\n→ token_add (dedupe, max 32)"]
+  end
+
+  E7 -. "fills" .-> K1
+  M4 -- "0 (STEN + tokens + optional oid/vars)" --> M5["log STEN/tokens/vars"]
+  M5 --> LP(("pass loop: pass 0..1, stop on rc==0\ninner: try each token; break past 420 s deadline"))
+
+  LP --> TT
+
+  subgraph TT["try_token(prompt_json, token, with_extras=(pass==1)) — one full WebSocket attempt, 30 s"]
+    T1["WSAStartup once; fresh ids: sess(hex32), crid/xsid/convid(uuid4),\ntrace/rid(hex32) — fresh ConversationId per attempt"]
+    T1 --> T2["build URL: /m365Copilot/Chathub/[oid@]sten (oid@ only when with_extras)\n?chatsessionid=sess&amp;XRoutingParameterSessionKey=sess\n&amp;clientrequestid=crid&amp;X-SessionId=xsid&amp;ConversationId=convid\n&amp;access_token=token&amp;variants= (empty pass 0; percent-encoded blob pass 1)\nsource=officedesktop, product=Office, agentHost=Bizchat.FullScreen,\nlicenseType=Starter, isEdu=false, agent=web,\nscenario=OfficeWebPaidConsumerCopilot"]
+    T2 --> T3["getaddrinfo substrate.office.com:443 → connect\nsocket SO_RCVTIMEO = 30 s"]
+    T3 --> T4["Schannel/SSPI TLS (inbox secur32.dll): AcquireCredentialsHandleW\nTLS1.2/1.3 client + Windows-trust chain validation\nInitializeSecurityContextW handshake, SNI = host; EncryptMessage/\nDecryptMessage records (no vendored TLS)"]
+    T4 --> T5["WS upgrade: GET + Sec-WebSocket-Key (16 rand bytes, base64)\n+ permessage-deflate ext + UA Python/3.13 websockets/17.0.1\nread headers to CRLF CRLF; REQUIRE 101"]
+    T5 -- "not 101 / connect fails" --> TF["log failure → return 0"]
+    T5 -- "101" --> T6["SignalR handshake: send exactly 32 bytes\nJSON protocol negotiation + 0x1E record separator"]
+    T6 --> T7["send chat invocation frame (0x1E terminated):\ntype 4, invocationId 0, target chat, arguments:\nsource officedesktop, clientCorrelationId, optionsSets\n(flux_v3_progress_messages, enable_msa_user, rich_responses,\nenable_batch_token_processing), streamingMode ConciseWithPadding,\nallowedMessageTypes Chat/Suggestion/Progress/GeneratedCode/\nDisengaged/EndOfRequest, traceId, clientInfo win32/Office,\nmessage = text prompt, requestId, locale en-us, tone Magic"]
+    T7 --> T8(("recv loop until 30 s"))
+    T8 --> T9{"ws_recv_msg"}
+    T9 -- "r &lt; 0 or opcode 8 (close)" --> TS
+    T9 -- "opcode 1/2 (text/binary)" --> T10["split frames on 0x1E"]
+    T10 --> T11{"json_type(frame)"}
+    T11 -- "1 (stream item)" --> T12["json_extract_reply: assistant text from the\nscoped messages[] array at its element depth\n(ignores nested suggested follow-ups)\n→ copy to text buf, got_text=1"]
+    T12 --> T8
+    T11 -- "2 or 3 (completion)" --> T13["json_result_message (result.message, definitive)\nelse json_extract_reply → got_text=1 → break out"]
+    T13 --> TS
+    T8 -- "30 s elapsed" --> TS(("streamed:"))
+    TS --> T14{"got_text AND non-empty?"}
+    T14 -- "yes" --> TO["out_s(text) → STDOUT ONLY\nreturn 1 (success)"]
+    T14 -- "no" --> TF
+  end
+
+  TT -- "rc=0 on first success" --> MX["rc != 0 ?\nlog no harvested session yielded a reply\nfree prompt_json, return rc"]
+  LP -- "pass 0 failed → pass 1 with oid/variants" --> LP
+  MX --> DONE([exit 0 iff reply captured])
+
+  classDef err fill:#7f1d1d,color:#fff
+  classDef ok fill:#14532d,color:#fff
+  class X1,TF err
+  class TO,DONE ok
+</pre>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, flowchart: { htmlLabels: true } });
+</script>
+</body>
+</html>

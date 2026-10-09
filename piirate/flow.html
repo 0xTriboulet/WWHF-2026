@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>piirate — code flow</title>
+<style>
+  body { font-family: ui-monospace, Consolas, monospace; background:#0f1115; color:#e6e6e6; margin:24px; }
+  h1 { font-size:20px; } p.note { color:#9aa4b2; max-width:1100px; }
+  .mermaid { background:#f5f5f5; padding:16px; border-radius:8px; }
+  code { color:#7ee787; }
+</style>
+</head>
+<body>
+<h1><code>piirate.exe</code> — recursive PII scan with an embedded GLiNER int8 ONNX model</h1>
+<p class="note">Derived 1:1 from <code>piirate/piirate.c</code> and <code>piirate/pii_tok.c</code> (post-format).
+Exit codes: <b>0</b> scan ok (zero findings is success) · <b>1</b> usage · <b>2</b> not a directory · <b>4</b> init/ORT error.</p>
+
+<pre class="mermaid">
+flowchart TD
+  A([wmain argc argv]) --> B["parse args: dir, --threshold (default 0.2),\n--labels (default: 17 README labels), --max-file-mb (default 4)\nany error → usage → return 1 (custom labels freed)"]
+  B --> C{"GetFileAttributesW(dir): directory?"}
+  C -- "no" --> R2[("return 2")]
+  C -- "yes" --> D["pii_tok_init(): build FNV piece hash from tok_data.h\n(128k vocab) + parse NFKC charsmap u32-trie header"]
+  D --> E["prompt_build(labels): ids = for each label\n&lt;&lt;ENT&gt;&gt;(128001) pieces-of-label … &lt;&lt;SEP&gt;&gt;(128002)"]
+  E --> F["ort_init()"]
+
+  subgraph ORT["ort_init"]
+        F1["LoadLibraryW(inbox onnxruntime.dll) → GetProcAddress(OrtGetApiBase)\n→ GetApi(17) — Windows C:/Windows/System32/onnxruntime.dll\n(ORT 1.17.1 on Win11 24H2/25H2; nothing else to deploy)"] --> F2["CreateEnv + SessionOptions\n(intra-op threads = nproc/2, cap 8)"]
+    F2 --> F3["assemble 12 embedded parts → one 196,778,982-byte blob\nCreateSessionFromArray"] 
+    F3 --> F4["create Cpu memory info + verify graph contract:\n6 inputs {input_ids, attention_mask, words_mask, text_lengths,\nspan_idx, span_mask_int64} + 1 output {logits} — else fail 4"]
+  end
+  F --> ORT
+  F4 --> G["scan_dir(dir, depth 0, threshold)"]
+
+  subgraph SD["scan_dir — recursive, depth ≤ 32, no junctions"]
+    S1["FindFirstFileW(dir\\*)"] --> S2{"entry?"}
+    S2 -- "dotted/junction → skip" --> S2
+    S2 -- "directory" --> S3["scan_dir(subdir, depth+1)"] --> S2
+    S2 -- "file" --> S4["scan_file(path)"]
+    S2 -- "done" --> SX["FindClose"]
+    S4 --> S2
+  end
+
+  subgraph SF["scan_file(path)"]
+    R1["CreateFileW → ReadFile (cap = max-file-mb)\nUTF-16LE BOM → UTF-8 transcode; UTF-8 BOM stripped"] --> R3["split_words: regex \\w+ (?:[-_]\\w+)* | \\S\n(exact Unicode \\w table), word cap 1024 B"]
+    R3 --> R4["wl_tokenize: every word once via pii_tok_encode_word\n(concat ids; per-word piece count)"]
+    R4 --> R5{"w0 &lt; n_words?"}
+    R5 -- "yes" --> W["window = ≤ half the remaining token budget in words"]
+    W --> R6["infer_window(…, threshold, &used)"]
+    R6 --> R5b["w0 += used − 32 (overlap)\n(none: last window)"]
+    R5b --> R5
+    R5 -- "no" --> R7["stderr: path: N finding(s)"]
+  end
+  S4 --> R1
+  R7 --> S2
+
+  subgraph IW["infer_window(w0, nw)"]
+    I1["used = words fitted under seq cap:\n2 + prompt + Σ pieces ≤ 512 (DeBERTa max_position)"] --> I2["ids = [CLS] prompt-ids word-ids [SEP]\nwords_mask: prompt 0; first subtoken of word i = i+1, rest 0"]
+    I2 --> I3["attention = 1; text_lengths = [used];\nspan_idx = all (i, i+j) j&lt;12; span_mask = (i+j &lt; used)"]
+    I3 --> I4["six int64 OrtValues (CreateTensorWithDataAsOrtValue) → Run"]
+    I4 --> I5{"logits shape == [1, used, 12, n_labels]?"}
+    I5 -- "no" --> I6[("return 4")]
+    I5 -- "yes" --> I7["candidates: all (word s, width j, label c) with\nsigmoid(logit) &gt; threshold AND s+j+1 ≤ used"]
+    I7 --> I8["sort by score desc (insertion order ties) →\ngreedy keep if NOT overlapping a kept span\n(start &gt; kept.end or kept.start &gt; end)"]
+    I8 --> I9["sort by start → dedup by (char range, label) across windows\n→ stdout: path -&gt; label (score): span"]
+  end
+
+  subgraph TK["pii_tok_encode_word (per word) — HF tokenizers port"]
+    T1["literal &lt;&lt;ENT&gt;&gt;/&lt;&lt;SEP&gt;&gt; → 128001/128002"] --> T2["Strip: trim Unicode White_Space (l+r)"]
+    T2 --> T3["NFKC: precompiled_charsmap double-array trie,\nper codepoint, shortest-prefix mapping"]
+    T3 --> T4["Replace /  {2,}/ → single space"]
+    T4 --> T5["Metaspace: prepend ▁ (E2 96 81), ' ' → ▁,\nsplit on ▁ keeping it leading"]
+    T5 --> T6["Unigram optimized Viterbi per chunk:\npiece hash probes ≤ 32 B, unk score = min_score − 10,\nutf8-char boundary rule, fuse adjacent unks → single id 3"]
+  end
+  R4 --> T1
+
+  ORT --> SUM["stderr: scanned N files, M findings, K unreadable"]
+  SD --> SUM
+  SUM --> Z[("return 0")]
+
+  classDef err fill:#7f1d1d,color:#fff
+  classDef ok fill:#14532d,color:#fff
+  class R2,I6 err
+  class Z ok
+</pre>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, flowchart: { htmlLabels: true } });
+</script>
+</body>
+</html>

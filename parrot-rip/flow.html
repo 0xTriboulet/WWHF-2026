@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>parrot-rip — code flow</title>
+<style>
+  body { font-family: ui-monospace, Consolas, monospace; background:#0f1115; color:#e6e6e6; margin:24px; }
+  h1 { font-size:20px; } p.note { color:#9aa4b2; max-width:1100px; }
+  .mermaid { background:#f5f5f5; padding:16px; border-radius:8px; }
+  code { color:#7ee787; }
+</style>
+</head>
+<body>
+<h1><code>parrot-rip.exe</code> — voice → text via the inbox desktop SAPI5 engine</h1>
+<p class="note">Derived 1:1 from <code>parrot-rip/parrot-rip.c</code> (post-format).
+Two halves: <b>capture</b> (MME waveIn, 16 kHz PCM into a heap buffer) and
+<b>engine</b> (in-proc SpInprocRecognizer + dictation grammar fed the captured
+audio as an ISpStreamFormat stream, so the engine never touches the audio
+device). Exit codes: <b>0</b> utterance transcribed · <b>1</b>
+engine/usage/no-speech · <b>5</b> output-file error.</p>
+
+<pre class="mermaid">
+flowchart TD
+  A([wmain argc argv]) --> B["arg scan: --verbose/-v, out.txt optional\n--help → usage, return 0"]
+  B --> C["Listening… one utterance (60 s default window;
+--timeout N sets the period)"]
+
+  subgraph CAP["cap_wavein — MME waveIn capture"]
+    C1["waveInOpen(WAVE_MAPPER, 16 kHz 16-bit mono)\n8 × 32 000-byte WAVEHDRs queued"]
+    C1 --> C2["waveInStart → listen window (60 s default, --timeout N):\nWHDR_DONE buffers recycled (waveInAddBuffer)\npeak tracked for the silence gate"]
+    C2 --> C3{"peak > 0 and bytes > 0?"}
+    C3 -- "no (pure silence)" --> CE["return WAIT_TIMEOUT"]
+    C3 -- "yes" --> C4["return heap buffer + length + peak\n(ownership passes to caller)"]
+  end
+  C --> C1
+
+  subgraph SAPI["sapi_process_stream — feed PCM to the engine"]
+    S1["CoInitializeEx(MTA)\nCoCreateInstance(CLSID_SpInprocRecognizer)"]
+    S1 --> S2["CreateRecoContext → QI ISpEventSource"]
+    S2 --> S3["SetNotifyWin32Event() slot 7 — NO ARGS (SAPI\ncreates its own internal Win32 event)\nSetInterest(SPFEI_ALL_SR_EVENTS)"]
+    S3 --> S4["spfmt_create: raw PCM wrapped in an\nIStream + ISpStreamFormat COM object\n(GetFormat says 16 kHz/16-bit/mono PCM)"]
+    S4 --> S5["SetInput(stream, FALSE)\nCreateGrammar → LoadDictation → SetDictationState(ACTIVE)"]
+    S5 --> S6["GetNotifyEventHandle() slot 9\n→ SAPI's own event handle"]
+    S6 --> L(("listen loop: WaitForSingleObject(sapiEvent, ≤250 ms)\nto the recognition deadline (max(listen window, 30 s))"))
+    L -- "signaled" --> L2["GetEvents drain: 8 events per call"]
+    L2 --> L3{"event loop"}
+    L3a["SPEI_SOUND_START (35) / SOUND_END (36)\nPHRASE_START (37) / HYPOTHESIS (39)"] --> L3
+    L3 -- "SPEI_RECOGNITION (38)" --> L4["sapi_take_event: lParam → ISpRecoResult\nGetText(0, ALL) → CoTaskMemFree after UTF-8 copy\nappend to *out_utf8 (space-joined)"]
+    L3 -- "SPEI_END_SR_STREAM (34)" --> LX["engine consumed the buffer → done"]
+    L4 --> L3
+    L -. "deadline, no events" .-> LX2["hr = 0x80045052 (no recognition)"]
+  end
+  C4 --> S1
+
+  X["cleanup: SetDictationState(INACTIVE), release COM,\nsfmtRelease frees the stream (owns the PCM)\nCoUninitialize"] --> R{"status == 0 and text?"}
+  R -- "none" --> R1[("no speech recognized → return 1")]
+  R -- "text" --> P["fputs(text, stdout) + newline"]
+  P --> O{"out.txt given?"}
+  O -- "yes" --> O1["_wfopen; fwrite full text\nshort write/open fail → return 5"]
+  O -- "no" --> Z
+  O1 --> Z[("return 0")]
+
+  classDef err fill:#7f1d1d,color:#fff
+  classDef ok fill:#14532d,color:#fff
+  class CE,CE2,R1 err
+  class Z ok
+</pre>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, flowchart: { htmlLabels: true } });
+</script>
+</body>
+</html>

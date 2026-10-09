@@ -1,0 +1,21 @@
+# research / scratch archive — kept out of version control
+archive/
+
+# build outputs
+dist/
+**/dist/
+*.exe
+*.dll
+*.obj
+*.pdb
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# python leftovers (research venvs live under archive/)
+__pycache__/
+*.pyc
+.venv/
+.mitmvenv/

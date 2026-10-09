@@ -1,0 +1,10 @@
+# C89 style — applied to ocular-rip, parrot-rip, silent_copilot, piirate.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+PointerAlignment: Left
+SortIncludes: Never        # windows.h must stay first; order is load-bearing
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: false
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false

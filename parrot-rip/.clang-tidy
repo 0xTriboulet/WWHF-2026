@@ -1,0 +1,17 @@
+# parrot-rip: two categories are silenced file-wide:
+# 1. -clang-analyzer-unix.Malloc: the SAPI result text is converted to UTF-8 and
+#    handed to the caller via the out-param; the CSA ownership model can't see
+#    that hand-off and reports a false "Potential memory leak".
+# 2. -bugprone-easily-swappable-parameters: COM/IStream vtable implementations
+#    must keep the documented parameter signatures.
+# 3. -bugprone-casting-through-void,-performance-no-int-to-ptr: SPEVENT.lParam
+#    and WAV-header writes are COM/ABI-cast patterns (documented in the code).
+# 4. -bugprone-not-null-terminated-result,-bugprone-suspicious-realloc-usage:
+#    WAV binary-header construction writes fixed-size binary fields, not C
+#    strings; realloc+memcpy growth pattern is checked at the call site.
+# 5. -cert-dcl16-c: fires on lowercase 'l' suffix inside the system SAPI
+#    headers (sphelper.h etc), not in parrot-rip source.
+# 6. -bugprone-signed-bitwise: MME WAVEHDR flag clears (~WHDR_DONE) and SAPI
+#    grammar flag ORs (SPRAF_TopLevel | SPRAF_Active) — the documented Win32
+#    pattern this check is default-off upstream for.
+Checks: 'bugprone-*,cert-*,misc-*,-misc-include-cleaner,clang-analyzer-*,concurrency-*,portability-*,performance-*,-clang-analyzer-unix.Malloc,-bugprone-easily-swappable-parameters,-bugprone-casting-through-void,-performance-no-int-to-ptr,-bugprone-not-null-terminated-result,-bugprone-suspicious-realloc-usage,-cert-dcl16-c,-bugprone-signed-bitwise'

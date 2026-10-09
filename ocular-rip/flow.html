@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ocular-rip — code flow</title>
+<style>
+  body { font-family: ui-monospace, Consolas, monospace; background:#0f1115; color:#e6e6e6; margin:24px; }
+  h1 { font-size:20px; } p.note { color:#9aa4b2; max-width:1100px; }
+  .mermaid { background:#f5f5f5; padding:16px; border-radius:8px; }
+  code { color:#7ee787; }
+</style>
+</head>
+<body>
+<h1><code>ocular-rip.exe</code> — image → text via <code>Windows.Media.Ocr.OcrEngine</code></h1>
+<p class="note">Derived 1:1 from <code>ocular-rip/ocular-rip.c</code> (post-format) and <code>ocular-rip/winrt_ocr.h</code>.
+Every <code>*Async</code> out-param's default interface is <code>IAsyncInfo</code>; <code>async_wait</code> QIs it for the
+per-<code>T</code> <code>IAsyncOperation&lt;T&gt;</code> instantiation IID (generic-GUID computed, not in any winmd)
+and uses <code>put_Completed</code>=6 / <code>GetResults</code>=8 on that view.
+Exit codes: <b>0</b> ok · <b>1</b> usage · <b>4</b> OCR/HRESULT error · <b>5</b> output-file error.</p>
+
+<pre class="mermaid">
+flowchart TD
+  A([wmain argc argv]) --> B{argc != 3?}
+  B -- "yes" --> U[("usage to stderr, return 1")]
+  B -- "no" --> C["log Input/Output paths (stderr)"]
+  C --> D["winrt_ocr_file(argv1, &amp;text)"]
+
+  subgraph WOF["winrt_ocr_file"]
+    RI["RoInitialize(RO_INIT_MULTITHREADED)\n(tolerate RPC_E_CHANGED_MODE)"] --> RO["run_ocr(path, out)"]
+    RO --> RE[/"FAILED? → return HRESULT as int"/]
+    RE --> RU["RoUninitialize\nwinrt_ocr_file → status"]
+  end
+
+  subgraph ROC["run_ocr — one MTA pipeline; every *Async awaited at slots 11/13"]
+    N0["GetFullPathNameW(path) normalize (if fits)"]
+    S1["1) get_factory(Windows.Storage.Streams.FileRandomAccessStream,\nIID_IFileRandomAccessStreamStatics) → OpenAsync(path, accessMode=0/Read, &amp;op)"]
+    S2["2) get_factory(Windows.Graphics.Imaging.BitmapDecoder)\nCreateAsync(stream) → await → QI IID_IBitmapDecoder"]
+    S3["3) GetFrameAsync(0) → await → QI IID_IBitmapFrameWithSoftwareBitmap"]
+    S4["4) GetSoftwareBitmapAsync() → await → SoftwareBitmap"]
+    S5["5) get_factory(Windows.Media.Ocr.OcrEngine)\nTryCreateFromUserProfileLanguages() — SYNC, no async\n→ QI IID_IOcrEngine"]
+    S6["6) RecognizeAsync(softwareBitmap, &amp;op) → await → QI IID_IOcrResult"]
+    S7["7) get_Text() → HSTRING\nWindowsGetStringRawBuffer → wide_to_utf8"]
+    N0 --> S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7 --> DONE["done: release ladder\nWindowsDeleteString + Release each ref"]
+    S1 -. "any FAILED(hr) / await failure" .-> DONE
+    S2 -. "FAILED" .-> DONE
+    S3 -. "FAILED" .-> DONE
+    S4 -. "FAILED" .-> DONE
+    S5 -. "FAILED / engine==NULL" .-> DONE
+    S6 -. "FAILED" .-> DONE
+    S7 -. "FAILED" .-> DONE
+  end
+
+  subgraph AW["async_wait(op, instantiation_iid, stage) — shared driver"]
+    W1["validate result/op/op-&gt;lpVtbl; create event"] --> W2["QueryInterface(op, IID_IAsyncOp_&lt;T&gt;)\n→ typed view: put_Completed=6, get_Completed=7, GetResults=8"]
+    W2 --> W3["ResetEvent(g_completed.event); g_handler_set=0"]
+    W3 --> W4["put_Completed(&amp;g_completed) — slot 6 of the typed view\nagile delegate: IUnknown + IInspectable + IAgileObject\n+ first-unknown-handler-IID; Invoke at slot 3"]
+    W4 --> W5{"WaitForSingleObject 60s"}
+    W5 -- "timeout: read op IAsyncInfo get_Status/get_ErrorCode (verbose wedge diagnosis)" --> W6["WAIT_TIMEOUT (0x80070102) / E_FAIL"]
+    W5 -- "status != Completed(1)" --> W6
+    W5 -- "Completed(1)" --> W7["GetResults() — slot 8 → *result\nRelease(typed view); Release(op)"]
+  end
+
+  subgraph CLI["back in wmain"]
+    M1{"status != 0?"}
+    M1 -- "yes" --> R4[("OCR failed 0x%X → return 4")]
+    M1 -- "no" --> M2["_wfopen(argv2, wb)"]
+    M2 -- "NULL" --> R5a[("return 5")]
+    M2 -- "ok" --> M3{"fwrite full text?"}
+    M3 -- "short write" --> R5b[("close, return 5")]
+    M3 -- "ok" --> M4{"fclose ok?"}
+    M4 -- "fail" --> R5c[("return 5")]
+    M4 -- "ok" --> R0[("log byte count, return 0")]
+  end
+
+  RU --> M1
+  classDef err fill:#7f1d1d,color:#fff
+  classDef ok fill:#14532d,color:#fff
+  class U,R4,R5a,R5b,R5c,W6 err
+  class R0 ok
+</pre>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, flowchart: { htmlLabels: true } });
+</script>
+</body>
+</html>
